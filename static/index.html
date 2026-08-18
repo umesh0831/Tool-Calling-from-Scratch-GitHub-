@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tool Calling from Scratch</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Tool Calling from Scratch</h1>
+    <span class="badge model" id="model-badge">loading...</span>
+  </header>
+
+  <div id="chat-container">
+    <div class="tools-note">
+      <div class="tools-note-title">Available Tools</div>
+      <div class="tools-note-grid">
+        <div class="tool-item">
+          <span class="tool-name">send_mail</span>
+          <span class="tool-params">to, subject, body</span>
+        </div>
+        <div class="tool-item">
+          <span class="tool-name">schedule_meeting</span>
+          <span class="tool-params">title, attendees[], date, time</span>
+        </div>
+        <div class="tool-item">
+          <span class="tool-name">cancel_meeting</span>
+          <span class="tool-params">title, date</span>
+        </div>
+      </div>
+      <div class="tools-note-hint">These are stub tools with a 3-second delay — the focus is the mechanism, not the integration.</div>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <input
+      type="text"
+      id="user-input"
+      placeholder="Ask me to send an email, schedule or cancel a meeting..."
+      autofocus
+    />
+    <button id="send-btn">Send</button>
+  </div>
+
+  <script>
+    const chatContainer = document.getElementById("chat-container");
+    const userInput = document.getElementById("user-input");
+    const sendBtn = document.getElementById("send-btn");
+
+    let conversationHistory = [];
+    let toolCallCounter = 0;
+
+    fetch("/api/health")
+      .then((r) => r.json())
+      .then((d) => {
+        document.getElementById("model-badge").textContent = d.model;
+      });
+
+    userInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !sendBtn.disabled) sendMessage();
+    });
+    sendBtn.addEventListener("click", sendMessage);
+
+    async function sendMessage() {
+      const text = userInput.value.trim();
+      if (!text) return;
+
+      userInput.disabled = true;
+      sendBtn.disabled = true;
+      userInput.value = "";
+
+      addUserMessage(text);
+      conversationHistory.push({ role: "user", content: text });
+
+      const timeline = createTimeline();
+
+      // State tracking
+      let fullContent = "";
+      let roundContent = "";
+      let thinkingContent = "";
+      let stepCounter = 0;
+      let isThinking = false;
+      let currentThinkStep = null;
+      let currentThinkStream = null;
+      let currentGenStep = null;
+      let currentStreamEl = null;
+      let currentRawStep = null;
+      let currentRawStream = null;
+      let rawToolContent = "";
+
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: conversationHistory }),
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let currentEvent = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) {
+              currentEvent = line.slice(6).trim();
+              continue;
+            }
+            if (!line.startsWith("data:")) continue;
+
+            const dataStr = line.slice(5).trim();
+            if (!dataStr) continue;
+
+            let data;
+            try { data = JSON.parse(dataStr); } catch { continue; }
+
+            switch (currentEvent) {
+
+              case "llm_input": {
+                stepCounter++;
+                const llmInputStep = addStep(
+                  timeline,
+                  String(stepCounter),
+                  'Sending to LLM <button class="view-input-btn">View LLM Input</button>',
+                  "done"
+                );
+
+                const llmInputPre = document.createElement("pre");
+                llmInputPre.className = "llm-input-dump";
+                llmInputPre.style.display = "none";
+                llmInputPre.textContent = JSON.stringify(data.messages, null, 2);
+                llmInputStep.content.appendChild(llmInputPre);
+
+                const llmBtn = llmInputStep.title.querySelector(".view-input-btn");
+                llmBtn.addEventListener("click", (e) => {
+                  e.stopPropagation();
+                  const visible = llmInputPre.style.display !== "none";
+                  llmInputPre.style.display = visible ? "none" : "block";
+                  llmBtn.textContent = visible ? "View LLM Input" : "Hide LLM Input";
+                  scrollToBottom();
+                });
+
+                scrollToBottom();
+                break;
+              }
+
+              case "thinking": {
+                // Create thinking step on first thinking token
+                if (!currentThinkStep) {
+                  stepCounter++;
+                  currentThinkStep = addStep(timeline, String(stepCounter), "Thinking...", "active");
+                  currentThinkStream = document.createElement("div");
+                  currentThinkStream.className = "thinking-stream";
+                  currentThinkStep.content.appendChild(currentThinkStream);
+                  isThinking = true;
+                }
+                thinkingContent += data.content;
+                currentThinkStream.textContent = thinkingContent;
+                // Auto-scroll the thinking box itself
+                currentThinkStream.scrollTop = currentThinkStream.scrollHeight;
+                scrollToBottom();
+                break;
+              }
+
+              case "token": {
+                // Close thinking step if active
+                if (isThinking && currentThinkStep) {
+                  markStep(currentThinkStep, "done");
+                  currentThinkStep.title.innerHTML = `Step ${currentThinkStep.num}: <span class="highlight">Thinking complete</span>`;
+                  currentThinkStep = null;
+                  currentThinkStream = null;
+                  thinkingContent = "";
+                  isThinking = false;
+                }
+
+                // Create response step on first token
+                if (!currentGenStep) {
+                  stepCounter++;
+                  currentGenStep = addStep(timeline, String(stepCounter), "LLM generating response...", "active");
+                  currentStreamEl = document.createElement("div");
+                  currentStreamEl.className = "stream-text";
+                  currentGenStep.content.appendChild(currentStreamEl);
+                }
+
+                roundContent += data.content;
+                fullContent += data.content;
+                currentStreamEl.textContent = roundContent;
+                scrollToBottom();
+                break;
+              }
+
+              case "raw_tool_token": {
+                // Close thinking if active
+                if (isThinking && currentThinkStep) {
+                  markStep(currentThinkStep, "done");
+                  currentThinkStep.title.innerHTML = `Step ${currentThinkStep.num}: <span class="highlight">Thinking complete</span>`;
+                  currentThinkStep = null;
+                  currentThinkStream = null;
+                  thinkingContent = "";
+                  isThinking = false;
+                }
+
+                // Close gen step if active
+                if (currentGenStep) {
+                  markStep(currentGenStep, "done");
+                  currentGenStep.title.innerHTML = `Step ${currentGenStep.num}: <span class="highlight">LLM generated text</span>`;
+                  currentGenStep = null;
+                  currentStreamEl = null;
+                }
+
+                // Create raw output step on first raw token
+                if (!currentRawStep) {
+                  stepCounter++;
+                  currentRawStep = addStep(timeline, String(stepCounter), "Model outputting tool call (raw tokens)...", "active");
+                  currentRawStream = document.createElement("pre");
+                  currentRawStream.className = "raw-tool-stream";
+                  currentRawStep.content.appendChild(currentRawStream);
+                  rawToolContent = "";
+                }
+
+                rawToolContent += data.content;
+                currentRawStream.textContent = rawToolContent;
+                currentRawStream.scrollTop = currentRawStream.scrollHeight;
+                scrollToBottom();
+                break;
+              }
+
+              case "tool_call": {
+                // Close raw output step
+                if (currentRawStep) {
+                  markStep(currentRawStep, "done");
+                  currentRawStep.title.innerHTML = `Step ${currentRawStep.num}: <span class="highlight">Raw tool call parsed</span>`;
+                  currentRawStep = null;
+                  currentRawStream = null;
+                  rawToolContent = "";
+                }
+
+                toolCallCounter++;
+                stepCounter++;
+
+                const tcStep = addStep(
+                  timeline,
+                  String(stepCounter),
+                  `Parsed tool call: <span class="fn-name">${data.name}</span>`,
+                  "done"
+                );
+
+                // Key-value args
+                const argsContainer = document.createElement("div");
+                argsContainer.style.marginTop = "6px";
+                for (const [key, val] of Object.entries(data.arguments)) {
+                  const row = document.createElement("div");
+                  row.className = "kv-row";
+                  row.innerHTML = `<span class="kv-key">${key}:</span><span class="kv-val">${
+                    Array.isArray(val) ? val.join(", ") : val
+                  }</span>`;
+                  argsContainer.appendChild(row);
+                }
+                tcStep.content.appendChild(argsContainer);
+
+                // Raw JSON
+                const rawPre = document.createElement("pre");
+                rawPre.textContent = JSON.stringify(data, null, 2);
+                tcStep.content.appendChild(rawPre);
+
+                tcStep.element.dataset.toolName = data.name;
+                scrollToBottom();
+                break;
+              }
+
+              case "tool_running": {
+                stepCounter++;
+                const runStep = addStep(
+                  timeline,
+                  String(stepCounter),
+                  `Executing <span class="fn-name">${data.name}</span>...`,
+                  "active"
+                );
+
+                const timerEl = document.createElement("span");
+                timerEl.className = "elapsed";
+                runStep.label.appendChild(timerEl);
+                const startTime = Date.now();
+                runStep._timer = setInterval(() => {
+                  timerEl.textContent = `${((Date.now() - startTime) / 1000).toFixed(1)}s`;
+                }, 100);
+
+                runStep.element.dataset.toolName = data.name;
+
+                const waitMsg = document.createElement("div");
+                waitMsg.className = "stream-text";
+                waitMsg.textContent = "Tool is running (3-second simulated delay)...";
+                runStep.content.appendChild(waitMsg);
+
+                scrollToBottom();
+                break;
+              }
+
+              case "tool_result": {
+                const allSteps = timeline.querySelectorAll(".step");
+                for (const s of allSteps) {
+                  if (s.dataset.toolName === data.name && s.querySelector(".step-num.active")) {
+                    const stepObj = s._stepRef;
+                    if (stepObj && stepObj._timer) clearInterval(stepObj._timer);
+                    markStep(stepObj, "done");
+
+                    const resultPre = document.createElement("pre");
+                    resultPre.textContent = JSON.stringify(data.result, null, 2);
+                    s.querySelector(".step-content").appendChild(resultPre);
+                    break;
+                  }
+                }
+                scrollToBottom();
+                break;
+              }
+
+              case "tool_result_done": {
+                // Reset for next round
+                // (the llm_input event at the start of the next loop
+                //  will show the "View LLM Input" button automatically)
+                roundContent = "";
+                currentGenStep = null;
+                currentStreamEl = null;
+                currentRawStep = null;
+                currentRawStream = null;
+                rawToolContent = "";
+                scrollToBottom();
+                break;
+              }
+
+              case "done": {
+                // Close any active steps
+                if (isThinking && currentThinkStep) {
+                  markStep(currentThinkStep, "done");
+                }
+                if (currentGenStep) {
+                  markStep(currentGenStep, "done");
+                  currentGenStep.title.innerHTML = `Step ${currentGenStep.num}: <span class="highlight">LLM generated text</span>`;
+                }
+
+                if (roundContent) {
+                  addAssistantMessage(roundContent);
+                }
+                if (fullContent) {
+                  conversationHistory.push({
+                    role: "assistant",
+                    content: fullContent,
+                  });
+                }
+                scrollToBottom();
+                break;
+              }
+
+              case "error": {
+                const errEl = document.createElement("div");
+                errEl.style.color = "#f87171";
+                errEl.textContent = "Error: " + data.error;
+                timeline.appendChild(errEl);
+                break;
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Error in chat loop:", err);
+        const errDiv = document.createElement("div");
+        errDiv.style.cssText = "color:#f87171; max-width:740px; margin:0 auto; padding:12px;";
+        errDiv.textContent = "Error: " + err.message + " (check console for details)";
+        chatContainer.appendChild(errDiv);
+      }
+
+      userInput.disabled = false;
+      sendBtn.disabled = false;
+      userInput.focus();
+    }
+
+    // --- DOM helpers ---
+
+    function addUserMessage(text) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "msg-wrapper";
+      const msg = document.createElement("div");
+      msg.className = "msg-user";
+      msg.textContent = text;
+      wrapper.appendChild(msg);
+      chatContainer.appendChild(wrapper);
+      scrollToBottom();
+    }
+
+    function addAssistantMessage(text) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "msg-wrapper";
+      const msg = document.createElement("div");
+      msg.className = "msg-assistant";
+      msg.textContent = text;
+      wrapper.appendChild(msg);
+      chatContainer.appendChild(wrapper);
+      scrollToBottom();
+    }
+
+    function createTimeline() {
+      const tl = document.createElement("div");
+      tl.className = "process-timeline";
+
+      const header = document.createElement("div");
+      header.className = "process-header";
+      header.textContent = "Orchestration Pipeline";
+      tl.appendChild(header);
+
+      chatContainer.appendChild(tl);
+      scrollToBottom();
+      return tl;
+    }
+
+    function addStep(timeline, num, titleHtml, status) {
+      const step = document.createElement("div");
+      step.className = "step";
+
+      const label = document.createElement("div");
+      label.className = "step-label";
+
+      const numEl = document.createElement("span");
+      numEl.className = `step-num ${status}`;
+      numEl.textContent = num;
+
+      const titleEl = document.createElement("span");
+      titleEl.className = "step-title";
+      titleEl.innerHTML = `Step ${num}: ${titleHtml}`;
+
+      label.appendChild(numEl);
+      label.appendChild(titleEl);
+
+      if (status === "active") {
+        const spinner = document.createElement("span");
+        spinner.className = "spinner";
+        label.appendChild(spinner);
+      }
+
+      step.appendChild(label);
+
+      const content = document.createElement("div");
+      content.className = "step-content";
+      step.appendChild(content);
+
+      timeline.appendChild(step);
+
+      const ref = { element: step, label, title: titleEl, numEl, content, num };
+      step._stepRef = ref;
+
+      scrollToBottom();
+      return ref;
+    }
+
+    function markStep(stepRef, status) {
+      if (!stepRef) return;
+      stepRef.numEl.className = `step-num ${status}`;
+      const spinner = stepRef.label.querySelector(".spinner");
+      if (spinner) spinner.remove();
+    }
+
+    function scrollToBottom() {
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+  </script>
+</body>
+</html>
